@@ -42,6 +42,7 @@ from .interpImage import InterpImageTask
 from .scaleZeroPoint import ScaleZeroPointTask
 from .coaddHelpers import groupPatchExposures, getGroupDataRef
 from .scaleVariance import ScaleVarianceTask
+from .findSatellites import FindSatellitesTask
 from lsst.meas.algorithms import SourceDetectionTask
 from lsst.daf.butler import DeferredDatasetHandle
 
@@ -1742,6 +1743,11 @@ class CompareWarpAssembleCoaddConfig(AssembleCoaddConfig,
         target=SourceDetectionTask,
         doc="Detect sources on static sky model. Only used if doPreserveContainedBySource is True"
     )
+    findSatellites = pexConfig.ConfigurableField(
+        target=FindSatellitesTask,
+        doc="Detect satellite trails on difference between each psfMatched warp and static sky model. "
+            "Only used if doFilterMorphological is True."
+    )
     maxNumEpochs = pexConfig.Field(
         doc="Charactistic maximum local number of epochs/visits in which an artifact candidate can appear  "
             "and still be masked.  The effective maxNumEpochs is a broken linear function of local "
@@ -1809,6 +1815,12 @@ class CompareWarpAssembleCoaddConfig(AssembleCoaddConfig,
         doc="Prefilter artifact candidates with less than this fraction overlapping good pixels",
         dtype=float,
         default=0.05
+    )
+    doFilterMorphological = pexConfig.Field(
+        doc="Filter artifact candidates based on morphological criteria, i.g. those that appear to "
+            "be satellite trails.",
+        dtype=bool,
+        default=False
     )
 
     def setDefaults(self):
@@ -1991,6 +2003,8 @@ class CompareWarpAssembleCoaddTask(AssembleCoaddTask):
             self.makeSubtask("detectTemplate", schema=afwTable.SourceTable.makeMinimalSchema())
         if self.config.doScaleWarpVariance:
             self.makeSubtask("scaleWarpVariance")
+        if self.config.doFilterMorphological:
+            self.makeSubtask("findSatellites")
 
     @utils.inheritDoc(AssembleCoaddTask)
     def makeSupplementaryDataGen3(self, butlerQC, inputRefs, outputRefs):
@@ -2172,6 +2186,7 @@ class CompareWarpAssembleCoaddTask(AssembleCoaddTask):
         spanSetArtifactList = []
         spanSetNoDataMaskList = []
         spanSetEdgeList = []
+        spanSetBadMorphoList = []
         badPixelMask = self.getBadPixelMask()
 
         # mask of the warp diffs should = that of only the warp
@@ -2201,6 +2216,12 @@ class CompareWarpAssembleCoaddTask(AssembleCoaddTask):
                     spans.setImage(slateIm, 1, doClip=True)
                 epochCountImage += slateIm
 
+                if self.config.doFilterMorphological:
+                    fitResult = self.findSatellites.run(warpDiffExp, slateIm)
+                    satMask = afwImage.Mask(coaddBBox)
+                    satMask.array[fitResult.mask] = 1
+                    spanSetSatellite = afwGeom.SpanSet.fromMask(satMask)
+
                 # PSF-Matched warps have less available area (~the matching kernel) because the calexps
                 # undergo a second convolution. Pixels with data in the direct warp
                 # but not in the PSF-matched warp will not have their artifacts detected.
@@ -2217,12 +2238,15 @@ class CompareWarpAssembleCoaddTask(AssembleCoaddTask):
                 nansMask = afwImage.MaskX(coaddBBox, 1)
                 spanSetList = []
                 spanSetEdgeMask = []
+                spanSetSatellite = []
 
             spanSetNoDataMask = afwGeom.SpanSet.fromMask(nansMask).split()
 
             spanSetNoDataMaskList.append(spanSetNoDataMask)
             spanSetArtifactList.append(spanSetList)
             spanSetEdgeList.append(spanSetEdgeMask)
+            if self.config.doFilterMorphological:
+                spanSetBadMorphoList.append(spanSetSatellite)
 
         if lsstDebug.Info(__name__).saveCountIm:
             path = self._dataRef2DebugPath("epochCountIm", tempExpRefList[0], coaddLevel=True)
@@ -2232,6 +2256,8 @@ class CompareWarpAssembleCoaddTask(AssembleCoaddTask):
             if spanSetList:
                 filteredSpanSetList = self.filterArtifacts(spanSetList, epochCountImage, nImage,
                                                            templateFootprints)
+                if self.config.doFilterMorphological and (spanSetBadMorphoList[i].getArea() != 0):
+                    filteredSpanSetList.append(spanSetBadMorphoList[i])
                 spanSetArtifactList[i] = filteredSpanSetList
 
         altMasks = []
